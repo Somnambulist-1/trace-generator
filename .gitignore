@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 trace-runs/
 run_logs/
+dist/
+R2E-Gym/

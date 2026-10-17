@@ -10,6 +10,9 @@ at worker startup and does not patch the R2E-Gym checkout on disk.
 ## Requirements
 
 - Linux with Docker, or access to the Kubernetes backend used by R2E-Gym.
+- Python 3.10, 3.11, 3.12, or 3.13 for the pinned R2E-Gym lockfile (the setup
+  script rejects newer interpreters rather than triggering incompatible source
+  builds).
 - A checkout of [R2E-Gym](https://github.com/R2E-Gym/R2E-Gym).
 - R2E-Gym's Python dependencies and images, installed as described upstream.
 - An API key for the selected LiteLLM model provider.
@@ -17,6 +20,51 @@ at worker startup and does not patch the R2E-Gym checkout on disk.
 The source analysis and prototype were made against R2E-Gym commit
 `0d94c4eb9431cd195c55a7ea3abd54006c9a1735`. Pinning that revision is recommended
 for reproducible traces.
+
+### Linux VM setup
+
+Running inside a Linux VM is supported and avoids the Docker Desktop/VMware
+hypervisor conflict on the Windows host. Linux containers inside the guest use
+the guest kernel; Docker Engine does not require another VM layer inside it.
+
+Copy this project directory into the VM, install Docker Engine, and run:
+
+```bash
+cd /path/to/AI-agent-research
+chmod +x setup_vm.sh verify_vm.sh
+./setup_vm.sh
+```
+
+For the prepared bundle, copy `dist/r2e-trace-vm-bundle.tar.gz` to the VM and
+extract it first:
+
+```bash
+mkdir -p ~/r2e-trace
+tar -xzf r2e-trace-vm-bundle.tar.gz -C ~/r2e-trace
+cd ~/r2e-trace
+chmod +x setup_vm.sh verify_vm.sh
+./setup_vm.sh
+```
+
+The script uses R2E-Gym's committed `uv.lock`, verifies the tested R2E-Gym
+revision, builds `R2E-Gym/.venv`, runs the local tests, installs the lifecycle
+hooks, and verifies Docker access. It does not call a model or start an Agent.
+If the VM has more than one supported interpreter, set `R2E_PYTHON_BIN` to the
+one to use; otherwise the script prefers Python 3.13, then 3.12, 3.11, and
+3.10.
+
+On Ubuntu/Debian, Docker Engine can be installed before running the script with:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y docker.io
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+```
+
+Log out and back in after changing Docker group membership, then run
+`./setup_vm.sh` again. Later, `./verify_vm.sh` performs a non-Agent readiness
+check.
 
 Example setup:
 
