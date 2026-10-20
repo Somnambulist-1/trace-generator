@@ -101,6 +101,44 @@ python trace_generator.py ... \
 The key remains in the environment inherited by Agent worker processes and is
 never written to the trace. A local model endpoint can use `--no-api-key-check`.
 
+### DeepSeek V4.1 Flash (where to enter the key)
+
+A dedicated launcher script is provided, so no manual Python environment
+activation is needed. Run it from a terminal in this project directory:
+
+```bash
+./run_deepseek.sh \
+  --task django__django-11333 --R 1 --T 1 \
+  --output-dir ./trace-runs/deepseek-smoke-001
+```
+
+When the terminal shows `DeepSeek API key (hidden):`, paste the key and press
+Enter. Characters are not echoed while typing. The script passes the key to the
+Agent through the `DEEPSEEK_API_KEY` environment variable and does not save it
+to a file. Do not post the key to chat or write it into code. The command above
+starts a real Agent once the key is entered and incurs API charges.
+
+To reuse the key across later runs in the current terminal, first run:
+
+```bash
+read -rsp "DeepSeek API key (hidden): " DEEPSEEK_API_KEY
+printf '\n'
+export DEEPSEEK_API_KEY
+```
+
+Then running the same launcher script will not prompt again. Afterwards,
+`unset DEEPSEEK_API_KEY` clears the variable in the current terminal. To view
+the arguments only, run `./run_deepseek.sh --help`; no key is required.
+
+Per the [DeepSeek official docs](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)
+(checked 2026-10-19), `deepseek-flash` currently corresponds to
+DeepSeek-V4.1-Flash-1017. The script uses the LiteLLM model name
+`deepseek/deepseek-flash` and the official endpoint `https://api.deepseek.com`,
+keeping the server's default thinking mode. The current R2E-Gym uses a
+text-command scaffold for this model, and the script explicitly disables native
+function calling. A valid key is still required after configuration; development
+verification did not make real model requests.
+
 ## Run
 
 `--task` accepts exact IDs from the selected dataset and can be supplied more than
