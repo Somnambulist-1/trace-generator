@@ -199,6 +199,9 @@ verified_trajectories.jsonl    trajectories after regression/reproduction stages
 .trace-parts/                  per-process trace shards retained for audit
 ```
 
+`run.json` records the full tracing command's wall-clock duration in
+`elapsed_seconds`; the same value appears in the final CLI JSON under `run`.
+
 Minimal lifecycle records contain:
 
 ```json

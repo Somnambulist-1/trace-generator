@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -255,6 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    started = time.perf_counter()
     invocation_dir = Path.cwd()
     if not args.r2e_root:
         raise ValueError("--r2e-root or R2E_GYM_ROOT is required")
@@ -384,8 +386,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         verified_json.append(json.dumps(data, ensure_ascii=False))
     _write_jsonl(output_dir / "verified_trajectories.jsonl", verified_json)
 
+    summary = merge_and_write(parts_dir, output_dir / "trace.jsonl", output_dir / "summary.json")
     run_manifest = {
         "tasks": requested,
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
         "R": args.rollouts,
         "T": args.reproduction_tests,
         "dataset": args.dataset,
@@ -403,7 +407,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     (output_dir / "run.json").write_text(
         json.dumps(run_manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
-    summary = merge_and_write(parts_dir, output_dir / "trace.jsonl", output_dir / "summary.json")
     return {"output_dir": str(output_dir), "summary": summary, "run": run_manifest}
 
 
