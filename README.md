@@ -238,6 +238,10 @@ machine) looks like:
   `delete_namespaced_pod` calls. Their `outcome` fields say
   `pod_create_accepted` and `pod_delete_accepted`; deletion acceptance is not a
   claim that kernel resources have already been reclaimed.
+- `tool` events record each high-level agent tool action dispatched by R2E-Gym,
+  including `tool_name` and `duration_seconds`. A nested `command` event may
+  also be present when that tool runs a shell command; it measures only the
+  lower-level command execution.
 - `peak_concurrent_sandboxes` is computed strictly from observed create/destroy
   events. A missing destroy remains active at trace end and is visible in the
   summary; the generator does not invent cleanup events.

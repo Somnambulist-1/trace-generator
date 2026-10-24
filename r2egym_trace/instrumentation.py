@@ -228,6 +228,51 @@ def _install_kubernetes_hooks() -> None:
     CoreV1Api.delete_namespaced_pod = traced_delete
 
 
+def _install_tool_hook() -> None:
+    """Trace each high-level agent tool invocation.
+
+    R2E-Gym dispatches parsed actions through ``RepoEnv.run_action``.  The
+    lower-level Docker command hook remains useful for shell-command detail,
+    while this hook records one duration for every tool selected by the agent.
+    """
+    from r2egym.agenthub.environment.env import RepoEnv
+
+    if getattr(RepoEnv.run_action, "_r2e_trace_hook", False):
+        return
+
+    original_run_action = RepoEnv.run_action
+
+    def traced_tool(environment: Any, action: Any, *args: Any, **kwargs: Any):
+        tool_name = getattr(action, "function_name", None)
+        if not tool_name:
+            return original_run_action(environment, action, *args, **kwargs)
+        started = time.perf_counter()
+        try:
+            result = original_run_action(environment, action, *args, **kwargs)
+        except BaseException as exc:
+            emit(
+                "tool",
+                tool_name=str(tool_name),
+                duration_seconds=time.perf_counter() - started,
+                outcome="error",
+                error=repr(exc),
+            )
+            raise
+
+        exit_code = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+        emit(
+            "tool",
+            tool_name=str(tool_name),
+            duration_seconds=time.perf_counter() - started,
+            exit_code=exit_code,
+            outcome="ok" if exit_code in (None, 0, "0") else "error",
+        )
+        return result
+
+    traced_tool._r2e_trace_hook = True  # type: ignore[attr-defined]
+    RepoEnv.run_action = traced_tool
+
+
 def _install_command_hook() -> None:
     from r2egym.agenthub.runtime.docker import DockerRuntime
 
@@ -271,6 +316,7 @@ def install_instrumentation(*, trace_commands: bool = True) -> None:
             return
         _install_docker_hooks()
         _install_kubernetes_hooks()
+        _install_tool_hook()
         if trace_commands:
             _install_command_hook()
         _INSTALLED = True
