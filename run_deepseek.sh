@@ -39,10 +39,10 @@ if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
   fi
 fi
 export DEEPSEEK_API_KEY
+export R2E_DEEPSEEK_NATIVE_TOOL_CALLING=1
 
 exec "${PYTHON_BIN}" "${PROJECT_ROOT}/trace_generator.py" \
   --r2e-root "${R2E_ROOT}" \
   --llm-name deepseek/deepseek-flash \
   --api-key-env DEEPSEEK_API_KEY \
-  --no-function-calling \
   "$@"
