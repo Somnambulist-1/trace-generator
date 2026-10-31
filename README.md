@@ -2,7 +2,8 @@
 
 This prototype runs the **real R2E-Gym Agent pipeline**, followed by R2E-Gym's
 regression and reproduction-test functions, and records sandbox lifecycle events
-as JSONL. It does not mock the Agent and does not replay saved trajectories.
+as JSONL. The generator calls the real Agent model; `replay_trace.py` instead
+executes recorded Agent tools/commands and both verifier stages without a model.
 
 The prototype is deliberately separate from R2E-Gym. Instrumentation is installed
 at worker startup and does not patch the R2E-Gym checkout on disk.
@@ -15,7 +16,7 @@ at worker startup and does not patch the R2E-Gym checkout on disk.
   builds).
 - A checkout of [R2E-Gym](https://github.com/R2E-Gym/R2E-Gym).
 - R2E-Gym's Python dependencies and images, installed as described upstream.
-- An API key for the selected LiteLLM model provider.
+- An API key for the selected LiteLLM model provider (generation only, not replay).
 
 The source analysis and prototype were made against R2E-Gym commit
 `0d94c4eb9431cd195c55a7ea3abd54006c9a1735`. Pinning that revision is recommended
@@ -186,13 +187,43 @@ when the Agent stage uses `--backend kubernetes`. The trace records the actual
 backend used by every lifecycle API call instead of assuming one backend for the
 whole run.
 
+## Full application replay
+
+Replay runs **Agent tools/commands → regression → reproduction**. It creates the
+original environments, executes every saved step in order with persistent
+in-container state, collects the resulting patch, runs the Agent's final reward
+test, then runs the real verifier functions. It does not apply the saved final
+patch as a substitute for executing the Agent's edits.
+
+```bash
+R2E-Gym/.venv/bin/python replay_trace.py \
+  trace-runs/deepseek-native-tools-full-001 \
+  --r2e-root "$PWD/R2E-Gym" \
+  --agent-workers 1 --verifier-workers 1 \
+  --llm-wait recorded \
+  --output-root trace-runs/full-replays
+```
+
+`--llm-wait recorded` (default) waits for each recorded model-call duration
+without making a model call. `--llm-wait none` removes those waits and is an
+explicit execution-only workload. Both actually execute tools and tests.
+Do not compare the two policies as if they were the same workload.
+
+The replay returns nonzero if a recorded exit code or final patch diverges,
+a stage fails/is missing, or observed lifecycle/infrastructure failures occur.
+Failed/partial records are retained. A failing application test is not by itself
+a replay failure: it may be exactly what the original Agent observed.
+
+See [the replay and timing guide](docs/replay.md) for measurement boundaries,
+operation CSVs, latency summaries and reproducibility limits.
+
 ## Output
 
 The selected output directory contains:
 
 ```text
 trace.jsonl                    merged, timestamp-ordered events
-summary.json                   lifecycle counts and peak concurrency
+summary.json                   lifecycle counts and timing distributions
 run.json                       requested workload and stage errors
 trajectories.jsonl             real Agent outputs
 verified_trajectories.jsonl    trajectories after regression/reproduction stages
@@ -210,23 +241,10 @@ Minimal lifecycle records contain:
 ```
 
 Those two lines illustrate the emitted schema; timestamps and IDs vary on every
-run. The project does not include a claimed R2E-Gym measurement because no model
-key or live Docker/Kubernetes backend was supplied during implementation.
-
-An illustrative `summary.json` (also not a measurement from this development
-machine) looks like:
-
-```json
-{
-  "total_sandbox_creations": 2,
-  "total_sandbox_destructions": 2,
-  "peak_concurrent_sandboxes": 1,
-  "creations_by_stage": {"agent": 2},
-  "destructions_by_stage": {"agent": 2},
-  "sandboxes_active_at_trace_end": 0,
-  "events_total": 14
-}
-```
+run. A complete `summary.json` produced by a real single-trajectory application
+replay is included at
+[`examples/full-replay-summary.json`](examples/full-replay-summary.json). It is a
+validation example, not a concurrency benchmark.
 
 ## Event semantics and limitations
 
@@ -245,8 +263,10 @@ machine) looks like:
 - `peak_concurrent_sandboxes` is computed strictly from observed create/destroy
   events. A missing destroy remains active at trace end and is visible in the
   summary; the generator does not invent cleanup events.
-- Commands are recorded without stdout/stderr and are truncated to 4096
-  characters. Use `--no-command-events` to record lifecycle only.
+- Commands retain their complete text and an output hash/size, without raw
+  stdout/stderr. `--no-command-events` omits command-level records; tool and
+  lifecycle timings remain. Older traces may contain truncated commands;
+  replay reads the full saved trajectory actions instead.
 - R2E-Gym's reproduction timeout wrapper forks a child process. The supported
   execution platform is Linux, where its current implementation and inherited
   instrumentation work together.

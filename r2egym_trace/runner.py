@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .instrumentation import configure_trace, emit, install_instrumentation
+from .instrumentation import configure_trace, emit, install_instrumentation, timed_event, trace_scope
 from .trace_io import merge_and_write
 
 
@@ -140,11 +140,12 @@ def _regression_worker(spec: dict[str, Any]) -> dict[str, Any]:
         )
         install_instrumentation(trace_commands=spec["trace_commands"])
         emit("stage_start")
-        from r2egym.agenthub.trajectory.trajectory import Trajectory
-        from r2egym.agenthub.verifiers.run_regression_tests import compute_regression_output
-
-        trajectory = Trajectory.model_validate_json(spec["trajectory_json"])
-        trajectory.regression_test_output = compute_regression_output(trajectory)
+        with trace_scope(phase="verifier_initialization"), timed_event("verifier_initialization"):
+            from r2egym.agenthub.trajectory.trajectory import Trajectory
+            from r2egym.agenthub.verifiers.run_regression_tests import compute_regression_output
+            trajectory = Trajectory.model_validate_json(spec["trajectory_json"])
+        with trace_scope(phase="verification"), timed_event("regression_execution"):
+            trajectory.regression_test_output = compute_regression_output(trajectory)
         emit("stage_end", success=True)
         return {
             "ok": True,
@@ -176,18 +177,46 @@ def _reproduction_worker(spec: dict[str, Any]) -> dict[str, Any]:
         )
         install_instrumentation(trace_commands=spec["trace_commands"])
         emit("stage_start")
-        from r2egym.agenthub.trajectory.trajectory import Trajectory
-        from r2egym.agenthub.verifiers.run_reproduction_tests import process_single_task
+        # R2E-Gym's reproduction module configures file logging at import time.
+        # Existing root-owned logs in the checkout can make that import fail;
+        # keep replay logs inside the writable trace output instead.
+        import r2egym.logging as r2e_logging
 
-        trajectory = Trajectory.model_validate_json(spec["trajectory_json"])
-        result = process_single_task(
-            (
-                trajectory.ds,
-                spec["test_patch"],
-                trajectory.true_output_patch,
-                spec["test_index"],
+        original_setup_logging = r2e_logging.setup_logging
+
+        def replay_setup_logging(name: str = "r2e", *args: Any, **kwargs: Any):
+            log_file = kwargs.get("log_file")
+            if log_file is None and args:
+                # setup_logging(name, level, log_file, console)
+                args = list(args)
+                if len(args) >= 2:
+                    log_file = args[1]
+            if log_file:
+                log_path = Path(str(log_file))
+                redirected = Path(spec["parts_dir"]) / "r2e-logs" / log_path
+                if "log_file" in kwargs:
+                    kwargs["log_file"] = str(redirected)
+                else:
+                    args = list(args)
+                    while len(args) < 2:
+                        args.append(None)
+                    args[1] = str(redirected)
+            return original_setup_logging(name, *args, **kwargs)
+
+        r2e_logging.setup_logging = replay_setup_logging
+        with trace_scope(phase="verifier_initialization"), timed_event("verifier_initialization"):
+            from r2egym.agenthub.trajectory.trajectory import Trajectory
+            from r2egym.agenthub.verifiers.run_reproduction_tests import process_single_task
+            trajectory = Trajectory.model_validate_json(spec["trajectory_json"])
+        with trace_scope(phase="verification"), timed_event("reproduction_execution"):
+            result = process_single_task(
+                (
+                    trajectory.ds,
+                    spec["test_patch"],
+                    trajectory.true_output_patch,
+                    spec["test_index"],
+                )
             )
-        )
         emit("stage_end", success=True)
         return {
             "ok": True,
@@ -224,6 +253,44 @@ def _write_jsonl(path: Path, records: list[str]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(record.rstrip("\n") + "\n")
+
+
+def _trajectory_task_id(trajectory: dict[str, Any]) -> str:
+    dataset_row = trajectory.get("ds") or {}
+    for key in ("instance_id", "task_id", "commit_hash", "docker_image"):
+        if dataset_row.get(key):
+            return str(dataset_row[key])
+    if trajectory.get("docker_image"):
+        return str(trajectory["docker_image"])
+    raise ValueError("Saved trajectory has no task identifier")
+
+
+def _read_trajectories(path: Path) -> list[str]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Saved trajectories not found: {path}")
+    records: list[str] = []
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                trajectory = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid trajectory JSON at {path}:{line_number}: {exc}") from exc
+            if not isinstance(trajectory, dict):
+                raise ValueError(f"Trajectory at {path}:{line_number} is not a JSON object")
+            _trajectory_task_id(trajectory)
+            records.append(json.dumps(trajectory, ensure_ascii=False))
+    if not records:
+        raise ValueError(f"Saved trajectories file is empty: {path}")
+    return records
+
+
+def replay_trace_run(trace_run: str | Path, **kwargs: Any) -> dict[str, Any]:
+    """Compatibility entry point for full Agent + verifier replay."""
+    from .replay import replay_trace_run as replay
+
+    return replay(trace_run, **kwargs)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -333,7 +400,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     successful = [result for result in agent_results if result["ok"]]
     _write_jsonl(output_dir / "trajectories.jsonl", [result["trajectory_json"] for result in successful])
 
-    verifier_workers = args.verifier_workers or min(32, max(1, len(successful)))
+    verifier_workers = args.verifier_workers or min(48, max(1, len(successful)))
     regression_specs = [
         {
             **common,
@@ -367,7 +434,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "test_patch": test_patch,
                 }
             )
-    reproduction_workers = args.verifier_workers or min(32, max(1, len(reproduction_specs)))
+    reproduction_workers = args.verifier_workers or min(48, max(1, len(reproduction_specs)))
     reproduction_results = _run_pool(_reproduction_worker, reproduction_specs, reproduction_workers)
 
     scores: dict[str, dict[int, float]] = {}
