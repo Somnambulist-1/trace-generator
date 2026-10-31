@@ -11,6 +11,11 @@ import json
 import os
 import threading
 import time
+import uuid
+import hashlib
+from functools import wraps
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +26,51 @@ _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
 _SEQUENCE = 0
 _ACTIVE: dict[tuple[str, str], str] = {}
+_SCOPE: ContextVar[dict[str, Any]] = ContextVar("trace_scope", default={})
+
+
+@contextmanager
+def trace_scope(**fields: Any):
+    """Attach phase/step/span metadata to nested operations, including forks."""
+    token = _SCOPE.set({**_SCOPE.get(), **fields})
+    try:
+        yield
+    finally:
+        _SCOPE.reset(token)
+
+
+@contextmanager
+def timed_event(event: str, **fields: Any):
+    """Measure one inclusive wall-time interval using the monotonic clock.
+
+    The yielded mapping may be updated with results. Nested intervals retain
+    parent IDs; their durations must not be added to their parent's duration.
+    Logging happens after the end timestamp and is outside this interval.
+    """
+    parent = _SCOPE.get().get("span_id")
+    span_id = f"{os.getpid()}-{uuid.uuid4().hex}"
+    started_wall = time.time_ns()
+    started = time.perf_counter_ns()
+    result = dict(fields)
+    try:
+        with trace_scope(span_id=span_id):
+            yield result
+    except BaseException as exc:
+        result.update(success=False, error=repr(exc), outcome="exception")
+        raise
+    finally:
+        ended = time.perf_counter_ns()
+        result.setdefault("success", True)
+        result.update(
+            span_id=span_id,
+            parent_span_id=parent,
+            start_timestamp_ns=started_wall,
+            end_timestamp_ns=started_wall + ended - started,
+            start_monotonic_ns=started,
+            end_monotonic_ns=ended,
+            duration_seconds=(ended - started) / 1_000_000_000,
+        )
+        emit(event, **result)
 
 
 def configure_trace(
@@ -81,6 +131,7 @@ def emit(event: str, **fields: Any) -> None:
         "sandbox_id": fields.pop("sandbox_id", None),
         "sequence": _SEQUENCE,
     }
+    record.update(_SCOPE.get())
     if ctx.get("test_id") is not None:
         record["test_id"] = ctx["test_id"]
     record.update({key: value for key, value in fields.items() if value is not None})
@@ -96,6 +147,17 @@ def _docker_sandbox_id(container: Any) -> str | None:
     return getattr(container, "id", None) or getattr(container, "short_id", None)
 
 
+def runtime_identity(runtime: Any) -> dict[str, Any]:
+    container = getattr(runtime, "container", None)
+    metadata = getattr(container, "metadata", None)
+    return {
+        "sandbox_id": _docker_sandbox_id(container) or getattr(metadata, "uid", None),
+        "sandbox_name": getattr(container, "name", None) or getattr(metadata, "name", None),
+        "backend": getattr(runtime, "backend", None),
+        "image": getattr(runtime, "docker_image", None),
+    }
+
+
 def _install_docker_hooks() -> None:
     from docker.models.containers import Container, ContainerCollection
 
@@ -106,40 +168,27 @@ def _install_docker_hooks() -> None:
     original_remove = Container.remove
 
     def traced_run(collection: Any, image: str, *args: Any, **kwargs: Any):
-        started = time.perf_counter()
-        container = original_run(collection, image, *args, **kwargs)
-        sandbox_id = _docker_sandbox_id(container)
-        sandbox_name = kwargs.get("name") or getattr(container, "name", None)
-        key = ("docker", sandbox_id or sandbox_name or "unknown")
-        _ACTIVE[key] = sandbox_id or sandbox_name or "unknown"
-        emit(
-            "sandbox_create",
-            sandbox_id=sandbox_id,
-            sandbox_name=sandbox_name,
-            backend="docker",
-            image=str(image),
-            duration_seconds=time.perf_counter() - started,
-            outcome="container_running",
-            source_api="docker.containers.run",
-        )
+        with timed_event("sandbox_create", backend="docker", image=str(image),
+                         sandbox_name=kwargs.get("name"), source_api="docker.containers.run") as timing:
+            container = original_run(collection, image, *args, **kwargs)
+            sandbox_id = _docker_sandbox_id(container)
+            sandbox_name = kwargs.get("name") or getattr(container, "name", None)
+            key = ("docker", sandbox_id or sandbox_name or "unknown")
+            _ACTIVE[key] = sandbox_id or sandbox_name or "unknown"
+            timing.update(sandbox_id=sandbox_id, sandbox_name=sandbox_name, outcome="container_running")
         return container
 
     def traced_remove(container: Any, *args: Any, **kwargs: Any):
         sandbox_id = _docker_sandbox_id(container)
         sandbox_name = getattr(container, "name", None)
         key = ("docker", sandbox_id or sandbox_name or "unknown")
-        started = time.perf_counter()
-        result = original_remove(container, *args, **kwargs)
-        if key in _ACTIVE:
-            emit(
-                "sandbox_destroy",
-                sandbox_id=sandbox_id,
-                sandbox_name=sandbox_name,
-                backend="docker",
-                duration_seconds=time.perf_counter() - started,
-                outcome="container_removed",
-                source_api="docker.container.remove",
-            )
+        if key not in _ACTIVE:
+            return original_remove(container, *args, **kwargs)
+        with timed_event("sandbox_destroy", sandbox_id=sandbox_id,
+                         sandbox_name=sandbox_name, backend="docker",
+                         source_api="docker.container.remove") as timing:
+            result = original_remove(container, *args, **kwargs)
+            timing["outcome"] = "container_removed"
             _ACTIVE.pop(key, None)
         return result
 
@@ -177,11 +226,6 @@ def _install_kubernetes_hooks() -> None:
     original_delete = CoreV1Api.delete_namespaced_pod
 
     def traced_create(api: Any, namespace: str, body: Any, *args: Any, **kwargs: Any):
-        started = time.perf_counter()
-        response = original_create(api, namespace, body, *args, **kwargs)
-        uid, pod_name = _kubernetes_identity(body=body, response=response)
-        key = ("kubernetes", pod_name or uid or "unknown")
-        _ACTIVE[key] = uid or pod_name or "unknown"
         image = None
         try:
             spec = body.get("spec", {}) if isinstance(body, dict) else body.spec
@@ -190,35 +234,24 @@ def _install_kubernetes_hooks() -> None:
             image = first.get("image") if isinstance(first, dict) else first.image
         except (AttributeError, IndexError, TypeError):
             pass
-        emit(
-            "sandbox_create",
-            sandbox_id=uid or pod_name,
-            sandbox_name=pod_name,
-            backend="kubernetes",
-            namespace=namespace,
-            image=image,
-            duration_seconds=time.perf_counter() - started,
-            outcome="pod_create_accepted",
-            source_api="kubernetes.create_namespaced_pod",
-        )
+        with timed_event("sandbox_create", backend="kubernetes", namespace=namespace,
+                         image=image, source_api="kubernetes.create_namespaced_pod") as timing:
+            response = original_create(api, namespace, body, *args, **kwargs)
+            uid, pod_name = _kubernetes_identity(body=body, response=response)
+            _ACTIVE[("kubernetes", pod_name or uid or "unknown")] = uid or pod_name or "unknown"
+            timing.update(sandbox_id=uid or pod_name, sandbox_name=pod_name, outcome="pod_create_accepted")
         return response
 
     def traced_delete(api: Any, name: str, namespace: str, *args: Any, **kwargs: Any):
         key = ("kubernetes", name)
         sandbox_id = _ACTIVE.get(key, name)
-        started = time.perf_counter()
-        response = original_delete(api, name, namespace, *args, **kwargs)
-        if key in _ACTIVE:
-            emit(
-                "sandbox_destroy",
-                sandbox_id=sandbox_id,
-                sandbox_name=name,
-                backend="kubernetes",
-                namespace=namespace,
-                duration_seconds=time.perf_counter() - started,
-                outcome="pod_delete_accepted",
-                source_api="kubernetes.delete_namespaced_pod",
-            )
+        if key not in _ACTIVE:
+            return original_delete(api, name, namespace, *args, **kwargs)
+        with timed_event("sandbox_destroy", sandbox_id=sandbox_id, sandbox_name=name,
+                         backend="kubernetes", namespace=namespace,
+                         source_api="kubernetes.delete_namespaced_pod") as timing:
+            response = original_delete(api, name, namespace, *args, **kwargs)
+            timing["outcome"] = "pod_delete_accepted"
             _ACTIVE.pop(key, None)
         return response
 
@@ -246,66 +279,128 @@ def _install_tool_hook() -> None:
         tool_name = getattr(action, "function_name", None)
         if not tool_name:
             return original_run_action(environment, action, *args, **kwargs)
-        started = time.perf_counter()
-        try:
+        with timed_event("tool", tool_name=str(tool_name),
+                         tool_parameters=getattr(action, "parameters", {}),
+                         **runtime_identity(environment.runtime)) as timing:
             result = original_run_action(environment, action, *args, **kwargs)
-        except BaseException as exc:
-            emit(
-                "tool",
-                tool_name=str(tool_name),
-                duration_seconds=time.perf_counter() - started,
-                outcome="error",
-                error=repr(exc),
-            )
-            raise
-
-        exit_code = result[1] if isinstance(result, tuple) and len(result) > 1 else None
-        emit(
-            "tool",
-            tool_name=str(tool_name),
-            duration_seconds=time.perf_counter() - started,
-            exit_code=exit_code,
-            outcome="ok" if exit_code in (None, 0, "0") else "error",
-        )
+            exit_code = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+            timing.update(exit_code=exit_code, success=exit_code in (None, 0, "0"),
+                          outcome="ok" if exit_code in (None, 0, "0") else "error")
         return result
 
     traced_tool._r2e_trace_hook = True  # type: ignore[attr-defined]
     RepoEnv.run_action = traced_tool
 
 
+def _install_deepseek_native_tool_calling() -> None:
+    """Enable native tool calls for DeepSeek when explicitly requested.
+
+    R2E-Gym currently limits native tool calling to a small model-name
+    allowlist.  The DeepSeek API supports the same structured ``tool_calls``
+    response through LiteLLM, so the trace runner can opt in without modifying
+    the external R2E-Gym checkout.
+    """
+    if os.getenv("R2E_DEEPSEEK_NATIVE_TOOL_CALLING") != "1":
+        return
+
+    from r2egym.agenthub.agent.agent import Agent
+
+    if getattr(Agent.model_query, "_r2e_deepseek_native_tools", False):
+        return
+
+    original_model_query = Agent.model_query
+
+    def model_query_with_deepseek_tools(
+        agent: Any, messages: list[dict[str, str]], temperature: float = 0
+    ):
+        if "deepseek" in str(getattr(agent, "llm_name", "")).lower():
+            if not getattr(agent, "use_fn_calling", False):
+                agent.logger.warning(
+                    "Enabling native tool calling for DeepSeek via trace instrumentation"
+                )
+            agent.use_fn_calling = True
+        return original_model_query(agent, messages, temperature)
+
+    model_query_with_deepseek_tools._r2e_deepseek_native_tools = True  # type: ignore[attr-defined]
+    Agent.model_query = model_query_with_deepseek_tools
+
+
 def _install_command_hook() -> None:
     from r2egym.agenthub.runtime.docker import DockerRuntime
 
-    if getattr(DockerRuntime.run, "_r2e_trace_hook", False):
-        return
-    original_run = DockerRuntime.run
+    def wrap(original, method):
+        @wraps(original)
+        def traced_command(runtime: Any, code: str, *args: Any, **kwargs: Any):
+            # Preserve full commands: a truncated command is not a replay input.
+            with timed_event("command", command=str(code),
+                             source_api=f"DockerRuntime.{method}",
+                             timeout_seconds=kwargs.get("timeout", args[0] if args else None),
+                             workdir=kwargs.get("workdir", getattr(runtime, "repo_path", None)),
+                             **runtime_identity(runtime)) as timing:
+                result = original(runtime, code, *args, **kwargs)
+                exit_code = result[-1] if isinstance(result, tuple) and len(result) > 1 else None
+                output = str(result[0]) if isinstance(result, tuple) else str(result)
+                timing.update(exit_code=exit_code, success=exit_code in (None, 0, "0"),
+                              outcome="ok" if exit_code in (None, 0, "0") else "error",
+                              output_sha256=hashlib.sha256(output.encode()).hexdigest(),
+                              output_bytes=len(output.encode()),
+                              infrastructure_error=str(exit_code) == "-1" and _SCOPE.get().get("phase") in
+                              ("verification", "agent_reward", "initialization"))
+            return result
+        traced_command._r2e_trace_hook = True
+        return traced_command
 
-    def traced_command(runtime: Any, code: str, *args: Any, **kwargs: Any):
-        started = time.perf_counter()
-        try:
-            result = original_run(runtime, code, *args, **kwargs)
-        except BaseException as exc:
-            emit(
-                "command",
-                sandbox_id=_docker_sandbox_id(getattr(runtime, "container", None)),
-                command=str(code)[:4096],
-                duration_seconds=time.perf_counter() - started,
-                exit_code=None,
-                error=repr(exc),
-            )
-            raise
-        exit_code = result[1] if isinstance(result, tuple) and len(result) > 1 else None
-        emit(
-            "command",
-            sandbox_id=_docker_sandbox_id(getattr(runtime, "container", None)),
-            command=str(code)[:4096],
-            duration_seconds=time.perf_counter() - started,
-            exit_code=exit_code,
-        )
-        return result
+    for method in ("run", "demux_run"):
+        original = getattr(DockerRuntime, method)
+        if not getattr(original, "_r2e_trace_hook", False):
+            setattr(DockerRuntime, method, wrap(original, method))
 
-    traced_command._r2e_trace_hook = True  # type: ignore[attr-defined]
-    DockerRuntime.run = traced_command
+
+def _install_environment_hooks() -> None:
+    """Measure readiness, setup, file transfers and stop+remove separately."""
+    from r2egym.agenthub.runtime.docker import DockerRuntime
+    from r2egym.agenthub.environment.env import RepoEnv
+
+    def wrap(original, event, is_env):
+        @wraps(original)
+        def measured(obj, *args, **kwargs):
+            runtime = obj.runtime if is_env else obj
+            with timed_event(event, source_api=f"{type(obj).__name__}.{original.__name__}",
+                             **runtime_identity(runtime)) as timing:
+                try:
+                    result = original(obj, *args, **kwargs)
+                    if event == "patch_application":
+                        code = result[1]
+                        timing.update(exit_code=code, success=code in (0, "0"))
+                    return result
+                except BaseException:
+                    # A failed constructor can already own a running container,
+                    # before RepoEnv is assigned in its caller. Clean up only a
+                    # container whose creation was observed by this process.
+                    identity = runtime_identity(runtime)
+                    if event == "environment_init" and identity.get("sandbox_id") in _ACTIVE.values():
+                        try:
+                            runtime.close()
+                        except Exception as cleanup_error:
+                            timing["cleanup_error"] = repr(cleanup_error)
+                    raise
+                finally:
+                    timing.update(runtime_identity(runtime))
+        measured._r2e_trace_hook = True
+        return measured
+
+    for cls, method, event, is_env in (
+        (DockerRuntime, "__init__", "environment_init", False),
+        (DockerRuntime, "start_container", "sandbox_start", False),
+        (DockerRuntime, "setup_env", "environment_setup", False),
+        (DockerRuntime, "stop_container", "sandbox_stop", False),
+        (DockerRuntime, "copy_to_container", "file_transfer", False),
+        (DockerRuntime, "apply_patch", "patch_application", False),
+        (RepoEnv, "add_commands", "tool_setup", True),
+    ):
+        original = getattr(cls, method)
+        if not getattr(original, "_r2e_trace_hook", False):
+            setattr(cls, method, wrap(original, event, is_env))
 
 
 def install_instrumentation(*, trace_commands: bool = True) -> None:
@@ -316,7 +411,9 @@ def install_instrumentation(*, trace_commands: bool = True) -> None:
             return
         _install_docker_hooks()
         _install_kubernetes_hooks()
+        _install_deepseek_native_tool_calling()
         _install_tool_hook()
+        _install_environment_hooks()
         if trace_commands:
             _install_command_hook()
         _INSTALLED = True
